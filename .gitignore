@@ -1,0 +1,13 @@
+# Python ignores
+__pycache__/
+*.py[cod]
+
+# ZED / Large Data ignores
+*.svo
+*.avi
+*.png
+*.jpg
+data/
+
+# OS specific
+.DS_Store
