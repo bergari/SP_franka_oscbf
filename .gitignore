@@ -9,5 +9,10 @@ __pycache__/
 *.jpg
 data/
 
+# Ignore large binary and model files
+*.pt
+*.run
+*.pkl
+
 # OS specific
 .DS_Store
