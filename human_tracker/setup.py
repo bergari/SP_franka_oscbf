@@ -23,8 +23,8 @@ setup(
         ],
     },
     entry_points={
-        'console_scripts': [
-        'skeleton_tracker_node = human_tracker.skeleton_tracker_node:main'
-        ],
+    'console_scripts': [
+        'skeleton_tracker_node = human_tracker.skeleton_tracker_node_4DHumans:main',
+    	],
     },
 )

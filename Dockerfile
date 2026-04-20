@@ -32,23 +32,37 @@ WORKDIR /opt/4D-Humans
 RUN mkdir -p data
 COPY basicModel_neutral_lbs_10_207_0_v1.0.0.pkl data/
 
+# Install ZED SDK 4.1
+RUN apt-get update && apt-get install -y zstd wget python3-pybind11 kmod python3-dev && \
+    wget https://download.stereolabs.com/zedsdk/4.1/cu121/ubuntu22 -O ZED_SDK_Linux_Ubuntu22.run && \
+    chmod +x ZED_SDK_Linux_Ubuntu22.run && \
+    ./ZED_SDK_Linux_Ubuntu22.run -- silent skip_tools && \
+    rm ZED_SDK_Linux_Ubuntu22.run && \
+    rm -rf /var/lib/apt/lists/*
+
 # Install PyTorch and 4D-Humans dependencies
-RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --break-system-packages
-RUN pip install .[all] --break-system-packages
+RUN pip install --default-timeout=2000 --retries 10 torch torchvision --index-url https://download.pytorch.org/whl/cu121
+RUN pip install .[all]
+RUN apt-get update && apt-get install -y libegl1 libegl1-mesa && rm -rf /var/lib/apt/lists/*
 
 # Download the remaining 4D-Humans weights
 RUN python3 -c "from hmr2.models import download_models, check_smpl_exists; download_models(); check_smpl_exists()"
 
-# Setup custom Ros2 workspace
-WORKDIR /ros2_ws
+RUN apt-get update && apt-get install -y python3-colcon-common-extensions && rm -rf /var/lib/apt/lists/*
 
-# Copy Franka/YOLO package into the container's source folder
+# Install the ZED Python API, YOLO, and pin NumPy
+RUN python3 -m pip install cython "numpy<2.0.0" ultralytics && \
+    cd /usr/local/zed/ && \
+    python3 get_python_api.py
+
+WORKDIR /ros2_ws
 COPY . src/SP_franka_oscbf/
 
 # Build the ROS 2 workspace
 RUN /bin/bash -c "source /opt/ros/humble/setup.bash && colcon build"
 # Source both the core ROS installation and custom workspace
-ENTRYPOINT ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros2_ws/install/setup.bash && exec \"$@\""]
+ENTRYPOINT ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros2_ws/install/setup.bash && exec \"$@\"", "bash"]
 
 # Launch specific node by default
-CMD ["ros2", "run", "human_tracker", "skeleton_tracker_node_4DHumans"]
+CMD ["ros2", "run", "human_tracker", "skeleton_tracker_node"]
+
