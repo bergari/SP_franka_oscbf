@@ -61,7 +61,7 @@ class TrackerNode(Node):
         self.prev_sources = {}
 
         # Initialize YOLO
-        self.model = YOLO("yolo26l-pose.pt")
+        self.model = YOLO("yolo26m-pose.pt")
 
         # Initialize 4D Humans (HMR2)
         self.get_logger().info("Loading 4D Humans HMR2 Model...")
@@ -74,6 +74,7 @@ class TrackerNode(Node):
         try:
             torch.load = _trusted_load
             self.hmr2_model, self.model_cfg = load_hmr2(DEFAULT_CHECKPOINT)
+            self.hmr2_model = torch.compile(self.hmr2_model)
         finally:
             torch.load = _original_load  
 
@@ -91,7 +92,8 @@ class TrackerNode(Node):
         self.zed = sl.Camera()
         init = sl.InitParameters()
         init.camera_resolution = sl.RESOLUTION.HD720
-        init.depth_mode = sl.DEPTH_MODE.NEURAL
+        # init.depth_mode = sl.DEPTH_MODE.NEURAL
+        init.depth_mode = sl.DEPTH_MODE.ULTRA
         init.coordinate_units = sl.UNIT.METER
         init.camera_fps = 30
         if self.zed.open(init) != sl.ERROR_CODE.SUCCESS:
@@ -234,6 +236,9 @@ class TrackerNode(Node):
                     self.target_lengths[(u,v)] = torch.norm(zed_3d[u] - zed_3d[v]).item()
             
             # Get Initial HMR2 Pose
+            if len(results[0].boxes.data) == 0:
+                # No human detected! Skip the 4D Humans processing for this frame
+                return
             tight_bbox = results[0].boxes.data[0].cpu().numpy()[:4]
             x1, y1, x2, y2 = tight_bbox
             cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
@@ -429,11 +434,14 @@ class TrackerNode(Node):
         
         # YOLO Inference
         results = self.model.track(frame_rgb, verbose=False, conf=0.6, persist=True)
-        if len(results[0].boxes.data) == 0:
-            cv2.imshow("Fused Tracker", display_frame)
-            cv2.waitKey(1)
-            return None
+        # if len(results[0].boxes.data) == 0:
+        #     cv2.imshow("Fused Tracker", display_frame)
+        #     cv2.waitKey(1)
+        #     return None
         
+        if len(results[0].boxes.data) == 0:
+            # No human detected! Skip the 4D Humans processing for this frame
+            return
         tight_bbox = results[0].boxes.data[0].cpu().numpy()[:4]
         kpts = results[0].keypoints.data[0].cpu().numpy()
         
@@ -822,8 +830,8 @@ class TrackerNode(Node):
                             cv2.circle(display_frame, (u, v), pix_radius, (255, 120, 0), 1)
 
         cv2.addWeighted(capsule_overlay, 0.4, display_frame, 1.0, 0, display_frame)
-        cv2.imshow("Fused Tracker", display_frame)
-        cv2.waitKey(1)
+        # cv2.imshow("Fused Tracker", display_frame)
+        # cv2.waitKey(1)
 
         self.prev_sources = fused_sources
 

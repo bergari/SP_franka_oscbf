@@ -2,21 +2,26 @@ services:
   vision_pipeline:
     build: .
     container_name: 4d_humans_pipeline
-    runtime: nvidia
     network_mode: host
+    ipc: host
     privileged: true
+    command: /bin/bash -c "rm -rf /ros2_ws/src/SP_franka_oscbf && source /opt/ros/humble/setup.bash && cd /ros2_ws && colcon build --symlink-install --packages-select human_tracker && source install/setup.bash && ros2 run human_tracker skeleton_tracker_node"
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility,video,display
       - DISPLAY=$DISPLAY
       - QT_X11_NO_MITSHM=1
+      - PYOPENGL_PLATFORM=osmesa
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix
       - /dev:/dev
+      - /run/udev:/run/udev:ro
+      - ./zed_models:/usr/local/zed/resources
+      - /home/pdz_cobot_lab/SP_franka_oscbf/human_tracker:/ros2_ws/src/human_tracker
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: all
-              capabilities: [gpu]
+              capabilities: [gpu, graphics, display, utility, compute, video]
