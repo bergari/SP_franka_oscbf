@@ -4,10 +4,19 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 from std_msgs.msg import Header, Float32MultiArray
+from geometry_utils import RobotMask, get_pixel_radius
+from filters import OneEuroFilter
+from constants import YOLO_TO_HMR2, YOLO_EDGES, HUMAN_CAPSULES, get_skeleton_map
 
 import pyzed.sl as sl
 import cv2
 import numpy as np
+import threading
+import time
+import os
+from datetime import datetime
+import signal
+import sys
 import torch
 import math
 from ultralytics import YOLO
@@ -16,43 +25,14 @@ import torchvision.transforms as T
 
 from hmr2.models import load_hmr2, DEFAULT_CHECKPOINT
 
-# Mapping yolo pose to hmr2 format (we only use the joints that are common to both)
-YOLO_TO_HMR2 = {
-    0: 0,   # Nose
-    5: 5,   # L Shoulder
-    6: 2,   # R Shoulder
-    7: 6,   # L Elbow
-    8: 3,   # R Elbow
-    9: 7,   # L Wrist
-    10: 4,  # R Wrist
-    11: 12, # L Hip
-    12: 9,  # R Hip
-}
-
-YOLO_EDGES = [
-    (0, 5), (0, 6), (5, 6),     # Head to shoulders
-    (5, 7), (7, 9),             # L Arm
-    (6, 8), (8, 10),            # R Arm
-    (5, 11), (6, 12), (11, 12), # Torso
-]
-
-HUMAN_CAPSULES = [
-    (17, 0, 0.18, (255, 0, 0)),   # Head (Neck to Nose)
-    (5, 7, 0.12, (0, 255, 0)),    # L Upper Arm
-    (7, 9, 0.08, (0, 255, 0)),    # L Forearm
-    (6, 8, 0.12, (0, 255, 255)),  # R Upper Arm
-    (8, 10, 0.08, (0, 255, 255)), # R Forearm
-    (17, 11, 0.22, (255, 255, 0)),# Torso L
-    (17, 12, 0.22, (255, 255, 0)),# Torso R
-    (9, 9, 0.15, (0, 255, 0)),    # L Hand
-    (10, 10, 0.15, (0, 255, 0))   # R Hand
-]
-
 class TrackerNode(Node):
     def __init__(self):
         super().__init__("tracker_node")
 
-        self.use_auto_calibration = True 
+        self.use_auto_calibration = False # Set to True if calibration with checkerboard desired
+        self.record_stream = False # Set to True if recording is desired
+        self.live_stream = True # Set to True if livestream is desired
+
         self.is_calibrated = not self.use_auto_calibration
         self.beta_is_calibrated = False
         self.joints_3d_prev = {}
@@ -92,10 +72,33 @@ class TrackerNode(Node):
         self.zed = sl.Camera()
         init = sl.InitParameters()
         init.camera_resolution = sl.RESOLUTION.HD720
-        # init.depth_mode = sl.DEPTH_MODE.NEURAL
-        init.depth_mode = sl.DEPTH_MODE.ULTRA
+        init.depth_mode = sl.DEPTH_MODE.NEURAL
         init.coordinate_units = sl.UNIT.METER
         init.camera_fps = 30
+        self.video_writer = None
+
+        """ Testing
+        # Setup Multi-Camera
+        name_list = []
+        last_ts_list = []
+        cameras = sl.Camera.get_device_list()
+        index = 0
+        for cam in cameras:
+            init.set_from_serial_number(cam.serial_number)
+            name_list.append("ZED {}".format(cam.serial_number))
+            print("Opening {}".format(name_list[index]))
+            zed_list.append(sl.Camera())
+            left_list.append(sl.Mat())
+            depth_list.append(sl.Mat())
+            timestamp_list.append(0)
+            last_ts_list.append(0)
+            status = zed_list[index].open(init)
+            if status != sl.ERROR_CODE.SUCCESS:
+                print(repr(status))
+                zed_list[index].close()
+            index = index + 1
+        """
+
         if self.zed.open(init) != sl.ERROR_CODE.SUCCESS:
             print("ZED failed to open.")
             exit()
@@ -116,7 +119,7 @@ class TrackerNode(Node):
             history=HistoryPolicy.KEEP_LAST, durability=DurabilityPolicy.VOLATILE,
         )
 
-        self.tracker_pub = self.create_publisher(MarkerArray, "tracker_centroids", qos_profile)
+        self.tracker_pub = self.create_publisher(MarkerArray, "tracker_centroids", qos_profile_rviz)
         self.yolo_pub = self.create_publisher(MarkerArray, "tracker_yolo", qos_profile_rviz)
         self.hmr_pub = self.create_publisher(MarkerArray, "tracker_hmr", qos_profile_rviz)
 
@@ -126,6 +129,14 @@ class TrackerNode(Node):
             self.sphere_callback, 
             qos_profile
         )
+
+        self.ee_target_sub = self.create_subscription(
+            Float32MultiArray, 
+            "ee_target_pos_array", 
+            self.ee_target_callback, 
+            qos_profile
+        )
+        self.latest_ee_target_3d = None
 
         self.freq = 30 
         self.timer = self.create_timer(1/self.freq, self.publish_tracker_state)
@@ -301,7 +312,7 @@ class TrackerNode(Node):
             marker = Marker()
             marker.header.frame_id = "base_link"
             marker.header.stamp = self.get_clock().now().to_msg()
-            marker.ns = f"{ns_prefix}_{self.get_skeleton_map(yolo_id)}" # use this only for debugging, in real use we want them all in the same namespace
+            marker.ns = f"{ns_prefix}_{get_skeleton_map(yolo_id)}" # use this only for debugging, in real use we want them all in the same namespace
             marker.id = yolo_id
             marker.type = Marker.SPHERE
             marker.action = Marker.ADD
@@ -378,11 +389,12 @@ class TrackerNode(Node):
         marker_array.markers.append(line_marker)
         return marker_array
 
-    def get_pixel_radius(self, z_depth, radius_m, focal_length):
-        if z_depth <= 0: return 1
-        return int((radius_m * focal_length) / z_depth)
-
     def publish_tracker_state(self):
+        if os.path.exists("/recordings/QUIT"):
+            self.get_logger().warn("QUIT file detected! Saving video and exiting...")
+            os.remove("/recordings/QUIT") # Delete it so it doesn't loop
+            import sys
+            sys.exit(0) # This triggers the 'finally' block in main()
         if self.use_auto_calibration and not self.is_calibrated:
             self.run_calibration()
             return
@@ -418,6 +430,13 @@ class TrackerNode(Node):
                 self.robot_masker = RobotMask(self.T_C_to_W)
             self.robot_masker.update_robot_spheres(self.robot_spheres)
 
+    def ee_target_callback(self, msg):
+        """Stores the latest 3D target position [x, y, z] in the robot's base frame."""
+        sx, sy, sz = msg.data
+        if self.is_calibrated and hasattr(self, 'T_C_to_W'):
+            self.T_W_to_C = np.linalg.inv(self.T_C_to_W)
+            self.latest_ee_target_3d = (self.T_W_to_C @ np.array([sx, sy, sz, 1.0]))[:3]
+
     def get_centroids(self):
         if self.zed.grab() != sl.ERROR_CODE.SUCCESS: return None
         
@@ -434,11 +453,11 @@ class TrackerNode(Node):
         
         # YOLO Inference
         results = self.model.track(frame_rgb, verbose=False, conf=0.6, persist=True)
-        # if len(results[0].boxes.data) == 0:
-        #     cv2.imshow("Fused Tracker", display_frame)
-        #     cv2.waitKey(1)
-        #     return None
-        
+        if len(results[0].boxes.data) == 0:
+            # cv2.imshow("Fused Tracker", display_frame)
+            # cv2.waitKey(1)
+            return None
+
         if len(results[0].boxes.data) == 0:
             # No human detected! Skip the 4D Humans processing for this frame
             return
@@ -707,14 +726,11 @@ class TrackerNode(Node):
                     pure_hmr_3d[y_id] = hmr2_absolute[h_id]
 
                 # Fusion of YOLO and HMR2
-                # ---------------------------------------------------------
-                # Fusion of YOLO and HMR2 (Forward Kinematics Approach)
-                # ---------------------------------------------------------
                 fused_3d_dict = {}
                 fused_sources = {}
                 raw_fused_positions = {} # Temporarily store pre-filtered positions for chain math
 
-                # 1. Define the Parent-Child relationships for the limbs
+                # Define the Parent-Child relationships for the limbs
                 parent_map = {
                     7: 5,   # L Elbow relies on L Shoulder
                     9: 7,   # L Wrist relies on L Elbow
@@ -722,7 +738,7 @@ class TrackerNode(Node):
                     10: 8,  # R Wrist relies on R Elbow
                 }
 
-                # 2. Define the strict resolution order (Core -> Limbs)
+                # Define the strict resolution order (Core -> Limbs)
                 resolution_order = [
                     0, 5, 6, 11, 12, # Resolve Head, Shoulders, and Hips first
                     7, 8,            # Then Elbows
@@ -812,12 +828,20 @@ class TrackerNode(Node):
                 #     if start in draw_points and end in draw_points:
                 #         p1, p2 = draw_points[start], draw_points[end]
                 #         z_avg = (fused_3d_dict[start][2] + fused_3d_dict[end][2]) / 2
-                #         thickness = self.get_pixel_radius(z_avg, r_m, self.cam_param.fx)
+                #         thickness = get_pixel_radius(z_avg, r_m, self.cam_param.fx)
                         
                 #         cv2.line(capsule_overlay, p1, p2, color, thickness)
                 #         cv2.circle(capsule_overlay, p1, thickness // 2, color, -1)
                 #         cv2.circle(capsule_overlay, p2, thickness // 2, color, -1)
 
+                # Draw target pos
+                if self.latest_ee_target_3d is not None:
+                    sx, sy, sz = self.latest_ee_target_3d
+                    if sz > 0.05:                        
+                        u = int((sx * self.cam_param.fx / sz) + self.cam_param.cx)
+                        v = int((sy * self.cam_param.fy / sz) + self.cam_param.cy)
+                        cv2.circle(display_frame, (u, v), radius=10, color=(0, 255, 0), thickness=-1)
+                
                 # Draw Robot Spheres
                 if hasattr(self, 'robot_masker'):            
                     for sphere in self.robot_masker.robot_spheres:
@@ -825,95 +849,70 @@ class TrackerNode(Node):
                         if sz > 0.05: 
                             u = int((sx * self.cam_param.fx / sz) + self.cam_param.cx)
                             v = int((sy * self.cam_param.fy / sz) + self.cam_param.cy)
-                            pix_radius = self.get_pixel_radius(sz, r, self.cam_param.fx)
+                            pix_radius = get_pixel_radius(sz, r, self.cam_param.fx)
                             cv2.circle(capsule_overlay, (u, v), pix_radius, (255, 120, 0), -1)
                             cv2.circle(display_frame, (u, v), pix_radius, (255, 120, 0), 1)
 
         cv2.addWeighted(capsule_overlay, 0.4, display_frame, 1.0, 0, display_frame)
-        # cv2.imshow("Fused Tracker", display_frame)
-        # cv2.waitKey(1)
 
-        self.prev_sources = fused_sources
+        if self.record_stream:
+            if self.video_writer is None:
+                h, w = display_frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*'XVID') 
+                path = f"/recordings/tracker_{datetime.now().strftime('%H%M%S')}.avi"
+                self.video_writer = cv2.VideoWriter(path, fourcc, 30.0, (w, h))
+                self.get_logger().info(f"Started recording: {path}")
+
+            if display_frame.shape[2] == 4:
+                display_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGRA2BGR)
+
+            self.video_writer.write(display_frame)
+
+        if self.live_stream:
+            cv2.imshow("Fused Tracker", display_frame)
+            cv2.waitKey(1)
 
         return fused_3d_dict, pure_yolo_3d, pure_hmr_3d, fused_sources
 
-    def get_skeleton_map(self, id):
-        mapping = {0:"nose", 5:"left shoulder", 6:"right shoulder", 7:"left elbow", 8:"right elbow", 
-                   9:"left wrist", 10:"right wrist", 11:"left hip", 12:"right hip", 
-                   13:"left knee", 14:"right knee", 15:"left ankle", 16:"right ankle"}
-        return mapping.get(id, "unknown")
-
-class OneEuroFilter:
-    """ Implements the One Euro Filter for smoothing 3D joint positions over time."""
-    def __init__(self, t0, x0, dx0=0.0, min_cutoff=0.1, beta=0.5, d_cutoff=1.0):
-        self.t_prev = t0
-        self.x_prev = x0
-        self.dx_prev = np.full(x0.shape, dx0) if isinstance(dx0, float) else dx0
-        self.min_cutoff = min_cutoff
-        self.beta = beta
-        self.d_cutoff = d_cutoff
-
-    def alpha(self, t, cutoff):
-        tau = 1.0 / (2 * math.pi * cutoff)
-        return 1.0 / (1.0 + tau / t)
-
-    def __call__(self, t, x):
-        t_e = t - self.t_prev
-        if t_e <= 0.0: return x
-        a_d = self.alpha(t_e, self.d_cutoff)
-        dx = (x - self.x_prev) / t_e
-        dx_hat = a_d * dx + (1.0 - a_d) * self.dx_prev
-        speed = np.linalg.norm(dx_hat)
-        cutoff = self.min_cutoff + self.beta * speed
-        a = self.alpha(t_e, cutoff)
-        x_hat = a * x + (1.0 - a) * self.x_prev
-        self.t_prev = t
-        self.x_prev = x_hat
-        self.dx_prev = dx_hat
-        return x_hat
-
-class RobotMask:
-    def __init__(self, T_C_to_W):
-        self.T_W_to_C = np.linalg.inv(T_C_to_W)
-        self.robot_spheres = np.zeros((0, 4))
-
-    def update_robot_spheres(self, spheres):
-        self.robot_spheres = np.zeros((0, 4)) 
-        for sphere in spheres:
-            sx, sy, sz, r = sphere
-            sphere_pos_cam = self.T_W_to_C @ np.array([sx, sy, sz, 1.0])
-            sphere_cam = np.array([[sphere_pos_cam[0], sphere_pos_cam[1], sphere_pos_cam[2], r]])
-            self.robot_spheres = np.append(self.robot_spheres, sphere_cam, axis=0)            
-
-    def is_joint_occluded(self, joint_pos, yolo_id):
-        for i, sphere in enumerate(self.robot_spheres):
-            self.yolo_id = yolo_id # for debugging
-            self.i = i # for debugging
-            if self.check_sphere_occlusion(sphere, joint_pos):
-                    return True
-        return False
+    def destroy_node(self):
+        """Native ROS 2 override to clean up hardware and files."""
+        self.get_logger().info("Closing VideoWriter and ZED Camera...")
+        
+        if hasattr(self, 'video_writer') and self.video_writer:
+            self.video_writer.release()
+            
+        if hasattr(self, 'zed') and self.zed.is_opened():
+            self.zed.close()
+            
+        cv2.destroyAllWindows()
+        super().destroy_node()
     
-    def check_sphere_occlusion(self, sphere, joint_pos):
-        sx, sy, sz, r = sphere
-        sphere_center = np.array([sx, sy, sz])
+def signal_handler(signal, frame):
+    global stop_signal
+    stop_signal = True
 
-        if np.dot(joint_pos, sphere_center) > 0:
-            joint_pos_norm = joint_pos / np.linalg.norm(joint_pos)
-            sphere_center_proj_scalar = np.dot(sphere_center, joint_pos_norm)
-            sphere_center_proj_vec = sphere_center_proj_scalar * joint_pos_norm
-            proj_vec = sphere_center_proj_vec - sphere_center
-            proj_length = np.linalg.norm(proj_vec)
-
-            return proj_length < (r + 0.05) and np.linalg.norm(joint_pos) > np.linalg.norm(sphere_center) - 0.1 # Add small buffer
-
-        return False
+def grab_run(index):
+    global stop_signal, zed_list, timestamp_list, left_list, depth_list
+    runtime = sl.RuntimeParameters()
+    while not stop_signal:
+        err = zed_list[index].grab(runtime)
+        if err == sl.ERROR_CODE.SUCCESS:
+            zed_list[index].retrieve_image(left_list[index], sl.VIEW.LEFT)
+            zed_list[index].retrieve_measure(depth_list[index], sl.MEASURE.DEPTH)
+            timestamp_list[index] = zed_list[index].get_timestamp(sl.TIME_REFERENCE.CURRENT).data_ns
+        time.sleep(0.001)
 
 def main(args=None):
-    rclpy.init(args=None)
+    rclpy.init(args=args)
     node = TrackerNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()  
+    
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, SystemExit):
+        pass 
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
