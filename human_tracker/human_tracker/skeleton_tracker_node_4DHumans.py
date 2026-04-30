@@ -4,9 +4,9 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 from std_msgs.msg import Header, Float32MultiArray
-from geometry_utils import RobotMask, get_pixel_radius
-from filters import OneEuroFilter
-from constants import YOLO_TO_HMR2, YOLO_EDGES, HUMAN_CAPSULES, get_skeleton_map
+from .geometry_utils import RobotMask, get_pixel_radius
+from .filters import OneEuroFilter
+from .constants import YOLO_TO_HMR2, YOLO_EDGES, HUMAN_CAPSULES, get_skeleton_map
 
 import pyzed.sl as sl
 import cv2
@@ -41,7 +41,7 @@ class TrackerNode(Node):
         self.prev_sources = {}
 
         # Initialize YOLO
-        self.model = YOLO("yolo26m-pose.pt")
+        self.model = YOLO("/usr/local/zed/resources/yolo26m-pose.pt")
 
         # Initialize 4D Humans (HMR2)
         self.get_logger().info("Loading 4D Humans HMR2 Model...")
@@ -69,6 +69,9 @@ class TrackerNode(Node):
         self.smpl_model = self.hmr2_model.smpl
 
         # Initialize ZED Camera
+        self.declare_parameter('serial_number', 0)
+        serial_num = self.get_parameter('serial_number').get_parameter_value().integer_value
+
         self.zed = sl.Camera()
         init = sl.InitParameters()
         init.camera_resolution = sl.RESOLUTION.HD720
@@ -77,27 +80,11 @@ class TrackerNode(Node):
         init.camera_fps = 30
         self.video_writer = None
 
-        """ Testing
-        # Setup Multi-Camera
-        name_list = []
-        last_ts_list = []
-        cameras = sl.Camera.get_device_list()
-        index = 0
-        for cam in cameras:
-            init.set_from_serial_number(cam.serial_number)
-            name_list.append("ZED {}".format(cam.serial_number))
-            print("Opening {}".format(name_list[index]))
-            zed_list.append(sl.Camera())
-            left_list.append(sl.Mat())
-            depth_list.append(sl.Mat())
-            timestamp_list.append(0)
-            last_ts_list.append(0)
-            status = zed_list[index].open(init)
-            if status != sl.ERROR_CODE.SUCCESS:
-                print(repr(status))
-                zed_list[index].close()
-            index = index + 1
-        """
+        if serial_num != 0:
+            init.set_from_serial_number(serial_num)
+            self.get_logger().info(f"Opening ZED camera with Serial Number: {serial_num}")
+        else:
+            self.get_logger().info("No serial number provided, opening default ZED camera.")
 
         if self.zed.open(init) != sl.ERROR_CODE.SUCCESS:
             print("ZED failed to open.")
@@ -120,8 +107,8 @@ class TrackerNode(Node):
         )
 
         self.tracker_pub = self.create_publisher(MarkerArray, "tracker_centroids", qos_profile_rviz)
-        self.yolo_pub = self.create_publisher(MarkerArray, "tracker_yolo", qos_profile_rviz)
-        self.hmr_pub = self.create_publisher(MarkerArray, "tracker_hmr", qos_profile_rviz)
+        # self.yolo_pub = self.create_publisher(MarkerArray, "tracker_yolo", qos_profile_rviz)
+        # self.hmr_pub = self.create_publisher(MarkerArray, "tracker_hmr", qos_profile_rviz)
 
         self.sphere_sub = self.create_subscription(
             Float32MultiArray, 
@@ -412,13 +399,13 @@ class TrackerNode(Node):
         fused_msg = self.build_marker_array(fused_3d, "fused", offset_y=0.0, sources=fused_sources)
         self.tracker_pub.publish(fused_msg)
 
-        # Pure YOLO (Left, offset +1.0 meter, Green color)
-        yolo_msg = self.build_marker_array(pure_yolo_3d, "yolo", offset_y=1.0, color=(0.0, 1.0, 0.0))
-        self.yolo_pub.publish(yolo_msg)
+        # # Pure YOLO (Left, offset +1.0 meter, Green color)
+        # yolo_msg = self.build_marker_array(pure_yolo_3d, "yolo", offset_y=1.0, color=(0.0, 1.0, 0.0))
+        # self.yolo_pub.publish(yolo_msg)
 
-        # Pure HMR2 (Right, offset -1.0 meter, Magenta color)
-        hmr_msg = self.build_marker_array(pure_hmr_3d, "hmr2", offset_y=-1.0, color=(1.0, 0.0, 1.0))
-        self.hmr_pub.publish(hmr_msg)
+        # # Pure HMR2 (Right, offset -1.0 meter, Magenta color)
+        # hmr_msg = self.build_marker_array(pure_hmr_3d, "hmr2", offset_y=-1.0, color=(1.0, 0.0, 1.0))
+        # self.hmr_pub.publish(hmr_msg)
 
     def sphere_callback(self, msg: Float32MultiArray):
         flat_data = np.array(msg.data)
@@ -886,21 +873,6 @@ class TrackerNode(Node):
             
         cv2.destroyAllWindows()
         super().destroy_node()
-    
-def signal_handler(signal, frame):
-    global stop_signal
-    stop_signal = True
-
-def grab_run(index):
-    global stop_signal, zed_list, timestamp_list, left_list, depth_list
-    runtime = sl.RuntimeParameters()
-    while not stop_signal:
-        err = zed_list[index].grab(runtime)
-        if err == sl.ERROR_CODE.SUCCESS:
-            zed_list[index].retrieve_image(left_list[index], sl.VIEW.LEFT)
-            zed_list[index].retrieve_measure(depth_list[index], sl.MEASURE.DEPTH)
-            timestamp_list[index] = zed_list[index].get_timestamp(sl.TIME_REFERENCE.CURRENT).data_ns
-        time.sleep(0.001)
 
 def main(args=None):
     rclpy.init(args=args)

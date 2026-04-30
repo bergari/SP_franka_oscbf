@@ -1,4 +1,5 @@
 import numpy as np
+import math
 
 class OneEuroFilter:
     """ Implements the One Euro Filter for smoothing 3D joint positions over time."""

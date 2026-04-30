@@ -1,11 +1,48 @@
 services:
-  vision_pipeline:
+  # -------------------------
+  # CAMERA 1 (Occluded View)
+  # -------------------------
+  cam1_pipeline:
     build: .
-    container_name: 4d_humans_pipeline
+    container_name: 4d_humans_cam1
     network_mode: host
     ipc: host
     privileged: true
-    command: /bin/bash -c "rm -rf /ros2_ws/src/SP_franka_oscbf && source /opt/ros/humble/setup.bash && cd /ros2_ws && colcon build --symlink-install --packages-select human_tracker && source install/setup.bash && exec ros2 run human_tracker skeleton_tracker_node"
+    # Note the --ros-args at the end of the command
+    command: /bin/bash -c "rm -rf /ros2_ws/src/SP_franka_oscbf && source /opt/ros/humble/setup.bash && cd /ros2_ws && colcon build --symlink-install --packages-select human_tracker && source install/setup.bash && exec ros2 run human_tracker skeleton_tracker_node --ros-args -r __node:=tracker_node_cam1 -r __ns:=/cam1 -p serial_number:=34783283"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility,video,display
+      - DISPLAY=$DISPLAY
+      - QT_X11_NO_MITSHM=1
+      - PYOPENGL_PLATFORM=osmesa
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /dev:/dev
+      - /run/udev:/run/udev:ro
+      - ./zed_models:/usr/local/zed/resources
+      - /home/pdz_cobot_lab/SP_franka_oscbf/human_tracker:/ros2_ws/src/human_tracker
+      - /home/pdz_cobot_lab/Videos/robot_recordings:/recordings
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, graphics, display, utility, compute, video]
+
+  # -----------------------------
+  # CAMERA 2 (Unoccluded View)
+  # -----------------------------
+  cam2_pipeline:
+    build: .
+    container_name: 4d_humans_cam2
+    network_mode: host
+    ipc: host
+    privileged: true
+    # Note the --ros-args at the end of the command
+    command: /bin/bash -c "rm -rf /ros2_ws/src/SP_franka_oscbf && source /opt/ros/humble/setup.bash && cd /ros2_ws && colcon build --symlink-install --packages-select human_tracker && source install/setup.bash && exec ros2 run human_tracker skeleton_tracker_node --ros-args -r __node:=tracker_node_cam2 -r __ns:=/cam2 -p serial_number:=33137761"
+
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility,video,display
