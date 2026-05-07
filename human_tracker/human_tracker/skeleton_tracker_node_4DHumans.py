@@ -6,7 +6,8 @@ from geometry_msgs.msg import Point
 from std_msgs.msg import Header, Float32MultiArray
 from .geometry_utils import RobotMask, get_pixel_radius
 from .filters import OneEuroFilter
-from .constants import YOLO_TO_HMR2, YOLO_EDGES, HUMAN_CAPSULES, get_skeleton_map
+from .constants import YOLO_TO_HMR2, YOLO_EDGES, HUMAN_CAPSULES, get_skeleton_map, surface_to_joint_proj
+
 
 import pyzed.sl as sl
 import cv2
@@ -29,16 +30,19 @@ class TrackerNode(Node):
     def __init__(self):
         super().__init__("tracker_node")
 
-        self.use_auto_calibration = False # Set to True if calibration with checkerboard desired
+        self.use_auto_calibration = True # Set to True if calibration with checkerboard desired
         self.record_stream = False # Set to True if recording is desired
-        self.live_stream = True # Set to True if livestream is desired
+        self.live_stream = False # Set to True if livestream is desired
 
         self.is_calibrated = not self.use_auto_calibration
-        self.beta_is_calibrated = False
+        self.calibrate_betas = True # Set to True if human propotion calibration for HMR2 is desired
+        self.beta_is_calibrated = not self.calibrate_betas
         self.joints_3d_prev = {}
         self.target_lengths = {}
         self.occlusion_reason = {}
         self.prev_sources = {}
+        self.source_transitions = {}
+        self.source_transition_duration = 0.35
 
         # Initialize YOLO
         self.model = YOLO("/usr/local/zed/resources/yolo26m-pose.pt")
@@ -74,6 +78,9 @@ class TrackerNode(Node):
 
         self.zed = sl.Camera()
         init = sl.InitParameters()
+        # if serial_num == 34783283:
+        #     init.camera_resolution = sl.RESOLUTION.HD1080
+        # else:
         init.camera_resolution = sl.RESOLUTION.HD720
         init.depth_mode = sl.DEPTH_MODE.NEURAL
         init.coordinate_units = sl.UNIT.METER
@@ -112,14 +119,14 @@ class TrackerNode(Node):
 
         self.sphere_sub = self.create_subscription(
             Float32MultiArray, 
-            "franka/robot_spheres", 
+            "/franka/robot_spheres", 
             self.sphere_callback, 
             qos_profile
         )
 
         self.ee_target_sub = self.create_subscription(
             Float32MultiArray, 
-            "ee_target_pos_array", 
+            "/ee_target_pos_array", 
             self.ee_target_callback, 
             qos_profile
         )
@@ -127,6 +134,35 @@ class TrackerNode(Node):
 
         self.freq = 30 
         self.timer = self.create_timer(1/self.freq, self.publish_tracker_state)
+
+    def smooth_source_transition(self, yolo_id, source, raw_3d, current_time):
+        prev_source = self.prev_sources.get(yolo_id)
+
+        if prev_source is not None and prev_source != source:
+            start_pos = raw_3d
+            if yolo_id in self.filters_3d:
+                start_pos = self.filters_3d[yolo_id].x_prev.copy()
+
+            self.source_transitions[yolo_id] = {
+                "source": source,
+                "start_time": current_time,
+                "start_pos": start_pos,
+            }
+
+        transition = self.source_transitions.get(yolo_id)
+        if transition is None or transition["source"] != source:
+            return raw_3d
+
+        elapsed = current_time - transition["start_time"]
+        progress = elapsed / self.source_transition_duration
+
+        if progress >= 1.0:
+            del self.source_transitions[yolo_id]
+            return raw_3d
+
+        progress = max(0.0, progress)
+        blend = progress * progress * (3.0 - 2.0 * progress)
+        return (1.0 - blend) * transition["start_pos"] + blend * raw_3d
 
     def run_calibration(self):
         """Looks for checkerboard and calculates the World-to-Camera Transform."""
@@ -317,6 +353,8 @@ class TrackerNode(Node):
             marker.scale.x = marker.scale.y = marker.scale.z = 0.08
 
             if sources is not None:
+                source_str = sources.get(yolo_id, "UNKNOWN")
+                marker.text = source_str
                 # Fused coloring: Green for YOLO, Magenta for HMR2
                 if sources.get(yolo_id) == "YOLO":
                     marker.color.r, marker.color.g, marker.color.b, marker.color.a = 0.0, 1.0, 0.0, 1.0
@@ -461,9 +499,27 @@ class TrackerNode(Node):
             yolo_confidence[yolo_id] = conf
 
             if conf > 0.95:
-                err, pt3d = self.point_cloud.get_value(int(kx), int(ky))
-                if err == sl.ERROR_CODE.SUCCESS and np.isfinite(pt3d[2]) and pt3d[2] > 0:
-                    candidate_3d[yolo_id] = pt3d[:3]
+                err, pt3d_raw = self.point_cloud.get_value(int(kx), int(ky))
+                if err == sl.ERROR_CODE.SUCCESS and np.isfinite(pt3d_raw[2]) and pt3d_raw[2] > 0:
+        
+                    xyz = np.array([pt3d_raw[0], pt3d_raw[1], pt3d_raw[2]])
+                    norm = np.linalg.norm(xyz)
+                    
+                    if norm > 0:
+                        offset = surface_to_joint_proj(yolo_id)
+                        xyz = xyz + (offset * (xyz / norm))
+                    
+                    pt3d = xyz
+                    
+                    if self.is_calibrated and hasattr(self, 'T_C_to_W'):
+                        pt_cam = np.array([pt3d[0], pt3d[1], pt3d[2], 1.0])       
+                        pt_world = self.T_C_to_W @ pt_cam                                         
+                        
+                        if pt_world[2] < 0.10: 
+                            self.occlusion_reason[yolo_id] = "inside_desk"
+                            continue
+
+                    candidate_3d[yolo_id] = pt3d
                     candidate_2d[yolo_id] = (int(kx), int(ky))
                 else:
                     self.occlusion_reason[yolo_id] = "no_depth"
@@ -643,6 +699,11 @@ class TrackerNode(Node):
         square_crop = np.zeros((half_size*2, half_size*2, 3), dtype=np.uint8)
         dst_x1, dst_y1 = max(0, -(cx - half_size)), max(0, -(cy - half_size))
         dst_x2, dst_y2 = dst_x1 + (src_x2 - src_x1), dst_y1 + (src_y2 - src_y1)
+
+        # Fusion of YOLO and HMR2
+        fused_3d_dict = {}
+        fused_sources = {}
+        raw_fused_positions = {} # Temporarily store pre-filtered positions for chain math
         
         # Use black padding if the crop goes outside the image boundaries to maintain the aspect ratio of the human body
         if src_x2 > src_x1 and src_y2 > src_y1:
@@ -712,10 +773,6 @@ class TrackerNode(Node):
                 for y_id, h_id in YOLO_TO_HMR2.items():
                     pure_hmr_3d[y_id] = hmr2_absolute[h_id]
 
-                # Fusion of YOLO and HMR2
-                fused_3d_dict = {}
-                fused_sources = {}
-                raw_fused_positions = {} # Temporarily store pre-filtered positions for chain math
 
                 # Define the Parent-Child relationships for the limbs
                 parent_map = {
@@ -765,16 +822,24 @@ class TrackerNode(Node):
                         else:
                             raw_3d = hmr2_absolute[hmr2_id]
 
+                    filter_input_3d = self.smooth_source_transition(
+                        yolo_id,
+                        fused_sources[yolo_id],
+                        raw_3d,
+                        current_time,
+                    )
+
                     # Save for the next joint in the chain to reference
-                    raw_fused_positions[yolo_id] = raw_3d   
+                    raw_fused_positions[yolo_id] = filter_input_3d   
 
                     # Low pass filtering
                     if yolo_id not in self.filters_3d:
                         # min_cutoff: smoothness when human stationary, beta determines how much filter opens up as velocity increases
-                        self.filters_3d[yolo_id] = OneEuroFilter(current_time, raw_3d, min_cutoff=0.01, beta=3)
+                        self.filters_3d[yolo_id] = OneEuroFilter(current_time, filter_input_3d, min_cutoff=0.01, beta=3)
                         
-                    smooth_3d = self.filters_3d[yolo_id](current_time, raw_3d)
+                    smooth_3d = self.filters_3d[yolo_id](current_time, filter_input_3d)
                     fused_3d_dict[yolo_id] = smooth_3d
+                    self.prev_sources[yolo_id] = fused_sources[yolo_id]
 
                 # 2D Visualization
                 draw_points = {}
@@ -794,9 +859,9 @@ class TrackerNode(Node):
                         kx, ky, conf = kpts[yolo_id]
                         # cv2.putText(display_frame, f"conf: {conf:.2f}", (u, v-20), 
                         #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                        if self.occlusion_reason.get(yolo_id):
-                            cv2.putText(display_frame, f"{self.occlusion_reason[yolo_id]}", (u, v-20), 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                        # if self.occlusion_reason.get(yolo_id):
+                        #     cv2.putText(display_frame, f"{self.occlusion_reason[yolo_id]}", (u, v-20), 
+                        #                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
                 # Virtual Neck Processing
                 # if 5 in fused_3d_dict and 6 in fused_3d_dict and 5 in draw_points and 6 in draw_points:
@@ -830,15 +895,15 @@ class TrackerNode(Node):
                         cv2.circle(display_frame, (u, v), radius=10, color=(0, 255, 0), thickness=-1)
                 
                 # Draw Robot Spheres
-                if hasattr(self, 'robot_masker'):            
-                    for sphere in self.robot_masker.robot_spheres:
-                        sx, sy, sz, r = sphere
-                        if sz > 0.05: 
-                            u = int((sx * self.cam_param.fx / sz) + self.cam_param.cx)
-                            v = int((sy * self.cam_param.fy / sz) + self.cam_param.cy)
-                            pix_radius = get_pixel_radius(sz, r, self.cam_param.fx)
-                            cv2.circle(capsule_overlay, (u, v), pix_radius, (255, 120, 0), -1)
-                            cv2.circle(display_frame, (u, v), pix_radius, (255, 120, 0), 1)
+                # if hasattr(self, 'robot_masker'):            
+                #     for sphere in self.robot_masker.robot_spheres:
+                #         sx, sy, sz, r = sphere
+                #         if sz > 0.05: 
+                #             u = int((sx * self.cam_param.fx / sz) + self.cam_param.cx)
+                #             v = int((sy * self.cam_param.fy / sz) + self.cam_param.cy)
+                #             pix_radius = get_pixel_radius(sz, r, self.cam_param.fx)
+                #             cv2.circle(capsule_overlay, (u, v), pix_radius, (255, 120, 0), -1)
+                #             cv2.circle(display_frame, (u, v), pix_radius, (255, 120, 0), 1)
 
         cv2.addWeighted(capsule_overlay, 0.4, display_frame, 1.0, 0, display_frame)
 
