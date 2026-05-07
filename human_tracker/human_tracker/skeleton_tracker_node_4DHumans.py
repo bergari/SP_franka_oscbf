@@ -32,17 +32,25 @@ class TrackerNode(Node):
 
         self.use_auto_calibration = True # Set to True if calibration with checkerboard desired
         self.record_stream = False # Set to True if recording is desired
-        self.live_stream = False # Set to True if livestream is desired
+        self.live_stream = True # Set to True if livestream is desired
 
         self.is_calibrated = not self.use_auto_calibration
-        self.calibrate_betas = True # Set to True if human propotion calibration for HMR2 is desired
-        self.beta_is_calibrated = not self.calibrate_betas
+        self.beta_is_calibrated = False
         self.joints_3d_prev = {}
         self.target_lengths = {}
         self.occlusion_reason = {}
         self.prev_sources = {}
         self.source_transitions = {}
-        self.source_transition_duration = 0.35
+        self.source_transition_duration = 0.12 # Short ramp for hard YOLO/HMR2 switches without adding too much CBF lag
+        self.prev_yolo_3d = {}
+        self.prev_yolo_time = {}
+        self.prev_yolo_trust = {}
+        self.yolo_accept_trust = 0.75
+        self.yolo_reject_trust = 0.25
+        self.depth_sample_radius = 2
+        self.filter_min_cutoff = 0.6
+        self.filter_beta = 2.0
+        self.self_occlusion_radius_m = 0.12
 
         # Initialize YOLO
         self.model = YOLO("/usr/local/zed/resources/yolo26m-pose.pt")
@@ -78,9 +86,6 @@ class TrackerNode(Node):
 
         self.zed = sl.Camera()
         init = sl.InitParameters()
-        # if serial_num == 34783283:
-        #     init.camera_resolution = sl.RESOLUTION.HD1080
-        # else:
         init.camera_resolution = sl.RESOLUTION.HD720
         init.depth_mode = sl.DEPTH_MODE.NEURAL
         init.coordinate_units = sl.UNIT.METER
@@ -136,6 +141,9 @@ class TrackerNode(Node):
         self.timer = self.create_timer(1/self.freq, self.publish_tracker_state)
 
     def smooth_source_transition(self, yolo_id, source, raw_3d, current_time):
+        if source == "BLEND" or self.prev_sources.get(yolo_id) == "BLEND":
+            return raw_3d
+
         prev_source = self.prev_sources.get(yolo_id)
 
         if prev_source is not None and prev_source != source:
@@ -163,6 +171,153 @@ class TrackerNode(Node):
         progress = max(0.0, progress)
         blend = progress * progress * (3.0 - 2.0 * progress)
         return (1.0 - blend) * transition["start_pos"] + blend * raw_3d
+
+    def clamp01(self, value):
+        return max(0.0, min(1.0, float(value)))
+
+    def smoothstep(self, edge0, edge1, value):
+        if edge0 == edge1:
+            return 1.0 if value >= edge1 else 0.0
+
+        x = self.clamp01((value - edge0) / (edge1 - edge0))
+        return x * x * (3.0 - 2.0 * x)
+
+    def sample_depth_near_keypoint(self, kx, ky, image_shape):
+        h, w = image_shape[:2]
+        cx = int(round(kx))
+        cy = int(round(ky))
+        radius = self.depth_sample_radius
+        samples = []
+
+        for py in range(max(0, cy - radius), min(h, cy + radius + 1)):
+            for px in range(max(0, cx - radius), min(w, cx + radius + 1)):
+                err, pt3d = self.point_cloud.get_value(px, py)
+                if err == sl.ERROR_CODE.SUCCESS and np.isfinite(pt3d[2]) and pt3d[2] > 0:
+                    samples.append([pt3d[0], pt3d[1], pt3d[2]])
+
+        total_pixels = (2 * radius + 1) ** 2
+        if not samples:
+            return None, 0.0, 1.0
+
+        samples = np.array(samples)
+        median_xyz = np.median(samples, axis=0)
+        valid_ratio = len(samples) / total_pixels
+        depth_std = np.std(samples[:, 2])
+        depth_trust = self.smoothstep(0.2, 0.65, valid_ratio)
+        depth_trust *= 1.0 - self.smoothstep(0.03, 0.12, depth_std)
+        return median_xyz, self.clamp01(depth_trust), depth_std
+
+    def set_trust_factor(self, yolo_trust, trust_factors, yolo_id, reason, factor):
+        if yolo_id not in yolo_trust:
+            return
+
+        factor = self.clamp01(factor)
+        trust_factors.setdefault(yolo_id, {})[reason] = min(
+            trust_factors.setdefault(yolo_id, {}).get(reason, 1.0),
+            factor,
+        )
+        yolo_trust[yolo_id] *= factor
+
+    def apply_trust_penalty(self, yolo_trust, trust_factors, yolo_id, factor, reason):
+        if yolo_id not in yolo_trust:
+            return
+
+        self.set_trust_factor(yolo_trust, trust_factors, yolo_id, reason, factor)
+
+    def penalize_less_plausible_joint(self, candidate_3d, yolo_trust, trust_factors, first_id, second_id, reason, factor=0.15):
+        if first_id not in candidate_3d or second_id not in candidate_3d:
+            return
+
+        if first_id in self.filters_3d and second_id in self.filters_3d:
+            first_err = np.linalg.norm(candidate_3d[first_id] - self.filters_3d[first_id].x_prev)
+            second_err = np.linalg.norm(candidate_3d[second_id] - self.filters_3d[second_id].x_prev)
+        else:
+            first_err = candidate_3d[first_id][2]
+            second_err = candidate_3d[second_id][2]
+
+        penalty_id = first_id if first_err > second_err else second_id
+        self.apply_trust_penalty(yolo_trust, trust_factors, penalty_id, factor, reason)
+
+    def update_occlusion_reasons(self, yolo_trust, trust_factors):
+        self.occlusion_reason = {}
+
+        for yolo_id, trust in yolo_trust.items():
+            if trust >= self.yolo_accept_trust:
+                continue
+
+            joint_factors = trust_factors.get(yolo_id, {})
+            if not joint_factors:
+                self.occlusion_reason[yolo_id] = "uncertain"
+                continue
+
+            self.occlusion_reason[yolo_id] = min(joint_factors, key=joint_factors.get)
+
+    def yolo_blend_weight(self, trust):
+        if trust <= self.yolo_reject_trust:
+            return 0.0
+        if trust >= self.yolo_accept_trust:
+            return 1.0
+        return self.smoothstep(self.yolo_reject_trust, self.yolo_accept_trust, trust)
+
+    def distance_to_segment_2d(self, point, seg_start, seg_end):
+        point = np.array(point, dtype=float)
+        seg_start = np.array(seg_start, dtype=float)
+        seg_end = np.array(seg_end, dtype=float)
+        seg_vec = seg_end - seg_start
+        seg_len_sq = np.dot(seg_vec, seg_vec)
+
+        if seg_len_sq <= 1e-6:
+            return np.linalg.norm(point - seg_start), 0.0
+
+        t = np.dot(point - seg_start, seg_vec) / seg_len_sq
+        t = self.clamp01(t)
+        closest = seg_start + t * seg_vec
+        return np.linalg.norm(point - closest), t
+
+    def apply_self_occlusion_penalties(self, candidate_3d, candidate_2d, yolo_trust, trust_factors):
+        arm_segments = [(5, 7), (7, 9), (6, 8), (8, 10)]
+        core_targets = [11, 12]
+
+        for target_id in core_targets:
+            if target_id not in candidate_3d or target_id not in candidate_2d:
+                continue
+
+            target_depth = candidate_3d[target_id][2]
+            if target_depth <= 0.05:
+                continue
+
+            pixel_radius = (self.self_occlusion_radius_m * self.cam_param.fx) / target_depth
+            pixel_radius = max(25.0, min(95.0, pixel_radius))
+
+            best_visibility = 1.0
+            for start_id, end_id in arm_segments:
+                if start_id not in candidate_2d or end_id not in candidate_2d:
+                    continue
+                if start_id not in candidate_3d or end_id not in candidate_3d:
+                    continue
+
+                dist_px, t = self.distance_to_segment_2d(
+                    candidate_2d[target_id],
+                    candidate_2d[start_id],
+                    candidate_2d[end_id],
+                )
+                segment_depth = ((1.0 - t) * candidate_3d[start_id][2]) + (t * candidate_3d[end_id][2])
+
+                # If the arm is clearly behind the hip, it is not occluding it.
+                if segment_depth > target_depth + 0.08:
+                    continue
+
+                visibility = self.smoothstep(0.35 * pixel_radius, pixel_radius, dist_px)
+                best_visibility = min(best_visibility, visibility)
+
+            if best_visibility < 1.0:
+                self.set_trust_factor(
+                    yolo_trust,
+                    trust_factors,
+                    target_id,
+                    "self_occlusion",
+                    best_visibility,
+                )
 
     def run_calibration(self):
         """Looks for checkerboard and calculates the World-to-Camera Transform."""
@@ -358,6 +513,8 @@ class TrackerNode(Node):
                 # Fused coloring: Green for YOLO, Magenta for HMR2
                 if sources.get(yolo_id) == "YOLO":
                     marker.color.r, marker.color.g, marker.color.b, marker.color.a = 0.0, 1.0, 0.0, 1.0
+                elif sources.get(yolo_id) == "BLEND":
+                    marker.color.r, marker.color.g, marker.color.b, marker.color.a = 1.0, 0.65, 0.0, 1.0
                 else:
                     marker.color.r, marker.color.g, marker.color.b, marker.color.a = 1.0, 0.0, 1.0, 1.0
             else:
@@ -492,39 +649,41 @@ class TrackerNode(Node):
         candidate_3d = {}
         candidate_2d = {}
         yolo_confidence = {}
+        yolo_trust = {}
+        trust_factors = {}
         self.occlusion_reason = {}  # Reset occlusion reasons each frame
         
         for yolo_id in YOLO_TO_HMR2.keys():
             kx, ky, conf = kpts[yolo_id]
             yolo_confidence[yolo_id] = conf
+            yolo_trust[yolo_id] = 1.0
+            self.set_trust_factor(yolo_trust, trust_factors, yolo_id, "low_conf", self.smoothstep(0.70, 0.98, conf))
 
-            if conf > 0.95:
-                err, pt3d_raw = self.point_cloud.get_value(int(kx), int(ky))
-                if err == sl.ERROR_CODE.SUCCESS and np.isfinite(pt3d_raw[2]) and pt3d_raw[2] > 0:
-        
-                    xyz = np.array([pt3d_raw[0], pt3d_raw[1], pt3d_raw[2]])
-                    norm = np.linalg.norm(xyz)
-                    
-                    if norm > 0:
-                        offset = surface_to_joint_proj(yolo_id)
-                        xyz = xyz + (offset * (xyz / norm))
-                    
-                    pt3d = xyz
-                    
-                    if self.is_calibrated and hasattr(self, 'T_C_to_W'):
-                        pt_cam = np.array([pt3d[0], pt3d[1], pt3d[2], 1.0])       
-                        pt_world = self.T_C_to_W @ pt_cam                                         
-                        
-                        if pt_world[2] < 0.10: 
-                            self.occlusion_reason[yolo_id] = "inside_desk"
-                            continue
+            pt3d_raw, depth_trust, depth_std = self.sample_depth_near_keypoint(kx, ky, frame_rgb.shape)
+            depth_reason = "noisy_depth" if depth_std > 0.08 else "no_depth"
+            self.set_trust_factor(yolo_trust, trust_factors, yolo_id, depth_reason, depth_trust)
 
-                    candidate_3d[yolo_id] = pt3d
-                    candidate_2d[yolo_id] = (int(kx), int(ky))
-                else:
-                    self.occlusion_reason[yolo_id] = "no_depth"
-            else:
-                self.occlusion_reason[yolo_id] = "low_conf"
+            if pt3d_raw is None:
+                continue
+
+            xyz = np.array([pt3d_raw[0], pt3d_raw[1], pt3d_raw[2]])
+            norm = np.linalg.norm(xyz)
+            
+            if norm > 0:
+                offset = surface_to_joint_proj(yolo_id)
+                xyz = xyz + (offset * (xyz / norm))
+            
+            pt3d = xyz
+            
+            # Uncomment to tend to use hmr2 for joints below desk level
+            # if self.is_calibrated and hasattr(self, 'T_C_to_W'):
+            #     pt_cam = np.array([pt3d[0], pt3d[1], pt3d[2], 1.0])       
+            #     pt_world = self.T_C_to_W @ pt_cam
+            #     desk_visibility = self.smoothstep(0.10, 0.20, pt_world[2])
+            #     self.set_trust_factor(yolo_trust, trust_factors, yolo_id, "inside_desk", desk_visibility)
+
+            candidate_3d[yolo_id] = pt3d
+            candidate_2d[yolo_id] = (int(kx), int(ky))
 
         pure_yolo_3d = {k: v for k, v in candidate_3d.items()} # save for debugging/visualization
 
@@ -532,102 +691,56 @@ class TrackerNode(Node):
             pt3d = candidate_3d[yolo_id]
             # Robot Sphere Check
             if hasattr(self, 'robot_masker'):
-                    if self.robot_masker.is_joint_occluded(pt3d, yolo_id):
-                        del candidate_3d[yolo_id]
-                        self.occlusion_reason[yolo_id] = "robot"
+                    robot_visibility = self.robot_masker.visibility_score(pt3d)
+                    self.set_trust_factor(yolo_trust, trust_factors, yolo_id, "robot", robot_visibility)
 
         # OVERLAP CHECK
         # Shoulders (IDs 5 and 6)
         if 5 in candidate_3d and 6 in candidate_3d:
             shoulder_width = np.linalg.norm(candidate_3d[5] - candidate_3d[6])
             if shoulder_width < 0.25: 
-                err_5 = np.linalg.norm(candidate_3d[5] - self.filters_3d[5].x_prev) if 5 in self.filters_3d else candidate_3d[5][2]
-                err_6 = np.linalg.norm(candidate_3d[6] - self.filters_3d[6].x_prev) if 6 in self.filters_3d else candidate_3d[6][2]
-                
-                # The joint that deviates more from its history (or is farther if no history) is likely the hallucination
-                if err_5 > err_6:
-                    del candidate_3d[5]
-                    self.occlusion_reason[5] = "overlap"
-                else:
-                    del candidate_3d[6]
-                    self.occlusion_reason[6] = "overlap"
+                self.penalize_less_plausible_joint(candidate_3d, yolo_trust, trust_factors, 5, 6, "overlap")
 
         # Hips (IDs 11 and 12)
         if 11 in candidate_3d and 12 in candidate_3d:
             hip_width = np.linalg.norm(candidate_3d[11] - candidate_3d[12])
             if hip_width < 0.15: 
-                err_11 = np.linalg.norm(candidate_3d[11] - self.filters_3d[11].x_prev) if 11 in self.filters_3d else candidate_3d[11][2]
-                err_12 = np.linalg.norm(candidate_3d[12] - self.filters_3d[12].x_prev) if 12 in self.filters_3d else candidate_3d[12][2]
-
-                # The joint that deviates more from its history (or is farther if no history) is likely the hallucination
-                if err_11 > err_12:
-                    del candidate_3d[11]
-                    self.occlusion_reason[11] = "overlap"
-                else:
-                    del candidate_3d[12]
-                    self.occlusion_reason[12] = "overlap"
+                self.penalize_less_plausible_joint(candidate_3d, yolo_trust, trust_factors, 11, 12, "overlap")
 
         # Wrists (IDs 9 and 10)
         if 9 in candidate_3d and 10 in candidate_3d:
             wrist_dist = np.linalg.norm(candidate_3d[9] - candidate_3d[10])
             if wrist_dist < 0.15: # Set threshold for wrist overlap in meters
-                if 9 in self.filters_3d and 10 in self.filters_3d:
-                    err_9 = np.linalg.norm(candidate_3d[9] - self.filters_3d[9].x_prev)
-                    err_10 = np.linalg.norm(candidate_3d[10] - self.filters_3d[10].x_prev)
-                    
-                    # The joint that deviates more from its history is likely the hallucination
-                    if err_9 > err_10:
-                        del candidate_3d[9]
-                        self.occlusion_reason[9] = "overlap"
-                    else:
-                        del candidate_3d[10]
-                        self.occlusion_reason[10] = "overlap"
+                self.penalize_less_plausible_joint(candidate_3d, yolo_trust, trust_factors, 9, 10, "overlap")
 
-                    # If no history, use current depth (the farther one is likely the hallucination)
-                else: 
-                    if candidate_3d[9][2] > candidate_3d[10][2]:
-                        del candidate_3d[9]
-                        self.occlusion_reason[9] = "overlap"
-                    else:
-                        del candidate_3d[10]
-                        self.occlusion_reason[10] = "overlap"
-
+        self.apply_self_occlusion_penalties(candidate_3d, candidate_2d, yolo_trust, trust_factors)
 
         # TEMPORAL Check
         current_3d = {}
         current_2d = {}
 
-        # Loop through all joints that have survived the overlap check
+        # Loop through all joints and reduce trust for implausible temporal jumps.
         for yolo_id, pt3d in candidate_3d.items():
-            is_valid = True
-
-            # if yolo_id in self.filters_3d:
-            #     prev_pt3d = self.filters_3d[yolo_id].x_prev
-            #     t_prev = self.filters_3d[yolo_id].t_prev
-            #     dt = current_time - t_prev
+            if yolo_id in self.prev_yolo_3d:
+                prev_pt3d = self.prev_yolo_3d[yolo_id]
+                t_prev = self.prev_yolo_time[yolo_id]
+                dt = current_time - t_prev
                 
-            #     if dt > 0:
-            #         dist = np.linalg.norm(pt3d - prev_pt3d)
-                    
-            #         max_allowed_jump = (1.0 * dt) + 0.10
-            #         if dt > 1.0: 
-            #             max_allowed_jump = 0.5
-                        
-            #         # --- NEW: OCCLUSION RECOVERY ---
-            #         # If it was hallucinated by HMR2 last frame, allow a massive 
-            #         # jump so it can snap back to the true YOLO measurement.
-            #         if self.prev_sources.get(yolo_id) == "HMR2":
-            #             max_allowed_jump = 1.0  # Allow a 1-meter teleport
-            #         # -------------------------------
-                        
-            #         if dist > max_allowed_jump:
-            #             is_valid = False
-            #             self.occlusion_reason[yolo_id] = "temporal"
-            
-            # If it survived the velocity check, it is a trusted ZED measurement
-            if is_valid:
-                current_3d[yolo_id] = pt3d
-                current_2d[yolo_id] = candidate_2d[yolo_id]
+                if 0.0 < dt < 0.5 and self.prev_yolo_trust.get(yolo_id, 0.0) > self.yolo_reject_trust:
+                    dist = np.linalg.norm(pt3d - prev_pt3d)
+                    max_expected_jump = (3.0 * dt) + 0.15
+                    if self.prev_sources.get(yolo_id) == "HMR2":
+                        max_expected_jump = max(max_expected_jump, 0.9)
+
+                    temporal_factor = 1.0 - self.smoothstep(
+                        max_expected_jump,
+                        max_expected_jump + 0.45,
+                        dist,
+                    )
+                    self.set_trust_factor(yolo_trust, trust_factors, yolo_id, "temporal", temporal_factor)
+
+            current_3d[yolo_id] = pt3d
+            current_2d[yolo_id] = candidate_2d[yolo_id]
 
         # Bone Length Check
         limb_chains = [
@@ -643,10 +756,13 @@ class TrackerNode(Node):
             if parent in current_3d and child in current_3d:
                 # Measure what the ZED camera sees
                 zed_bone_length = np.linalg.norm(current_3d[parent] - current_3d[child])
-                true_bone_length = self.target_lengths[(parent, child)] 
+                true_bone_length = self.target_lengths.get((parent, child))
+                if true_bone_length is None or true_bone_length <= 0:
+                    continue
 
-                # If the ZED measurement is off by more than 20%, one joint is hallucinating
-                if abs(zed_bone_length - true_bone_length) > 0.2*true_bone_length:
+                length_error = abs(zed_bone_length - true_bone_length)
+                length_factor = 1.0 - self.smoothstep(0.2 * true_bone_length, 0.5 * true_bone_length, length_error)
+                if length_factor < 1.0:
 
                     # Look at history to find which one is hallucinating
                     err_parent = 0.0
@@ -658,17 +774,16 @@ class TrackerNode(Node):
                     if child in self.filters_3d:
                         err_child = np.linalg.norm(current_3d[child] - self.filters_3d[child].x_prev)
                     
-                      # The joint with the highest error gets removed
-                    if err_parent > err_child:
-                        del current_3d[parent]
-                        self.occlusion_reason[parent] = "length"
-                        if parent in current_2d:
-                            del current_2d[parent]
-                    else:
-                        del current_3d[child]
-                        self.occlusion_reason[child] = "length"
-                        if child in current_2d:
-                            del current_2d[child]
+                    penalty_id = parent if err_parent > err_child else child
+                    self.apply_trust_penalty(yolo_trust, trust_factors, penalty_id, length_factor, "length")
+
+        self.update_occlusion_reasons(yolo_trust, trust_factors)
+
+        for yolo_id, pt3d in candidate_3d.items():
+            if yolo_trust.get(yolo_id, 0.0) > self.yolo_reject_trust:
+                self.prev_yolo_3d[yolo_id] = pt3d.copy()
+                self.prev_yolo_time[yolo_id] = current_time
+                self.prev_yolo_trust[yolo_id] = yolo_trust[yolo_id]
 
         # HMR2 Inference
         x1, y1, x2, y2 = tight_bbox
@@ -677,7 +792,7 @@ class TrackerNode(Node):
         # Look for Shoulders (5, 6) and Hips (11, 12)
         for target_id in [5, 6, 11, 12]:
             # Can use candidate 2d because even if the 3D is filtered out, the 2D keypoint can still be visible and useful for centering the crop
-            if target_id in candidate_2d: 
+            if target_id in candidate_2d and yolo_trust.get(target_id, 0.0) > self.yolo_reject_trust: 
                 core_x.append(candidate_2d[target_id][0])
                 core_y.append(candidate_2d[target_id][1])
         
@@ -755,7 +870,7 @@ class TrackerNode(Node):
                 hmr2_anchors = []
                 
                 for y_id in core_yolo_ids:
-                    if y_id in current_3d: # At this point, current_3d consists of non occupied Yolo/ZED joint measurements
+                    if y_id in current_3d and self.yolo_blend_weight(yolo_trust.get(y_id, 0.0)) > 0.5:
                         h_id = YOLO_TO_HMR2[y_id]
                         yolo_anchors.append(current_3d[y_id])
                         hmr2_anchors.append(joints_3d[h_id])
@@ -764,6 +879,19 @@ class TrackerNode(Node):
                     yolo_centroid = np.mean(yolo_anchors, axis=0)
                     hmr2_centroid = np.mean(hmr2_anchors, axis=0)
                     translation_offset = yolo_centroid - hmr2_centroid
+                    hmr2_absolute = joints_3d + translation_offset
+                elif any(y_id in self.filters_3d for y_id in core_yolo_ids):
+                    prev_anchors = []
+                    hmr2_anchors = []
+                    for y_id in core_yolo_ids:
+                        if y_id in self.filters_3d:
+                            h_id = YOLO_TO_HMR2[y_id]
+                            prev_anchors.append(self.filters_3d[y_id].x_prev)
+                            hmr2_anchors.append(joints_3d[h_id])
+
+                    prev_centroid = np.mean(prev_anchors, axis=0)
+                    hmr2_centroid = np.mean(hmr2_anchors, axis=0)
+                    translation_offset = prev_centroid - hmr2_centroid
                     hmr2_absolute = joints_3d + translation_offset
                 else:
                     # Fallback just in case the camera is completely blocked
@@ -795,32 +923,26 @@ class TrackerNode(Node):
                         continue
                         
                     hmr2_id = YOLO_TO_HMR2[yolo_id]
-                    raw_3d = None
-                    
-                    # CASE A: Joint is visible to ZED/YOLO
-                    if yolo_id in current_3d:
+                    yolo_weight = self.yolo_blend_weight(yolo_trust.get(yolo_id, 0.0))
+
+                    if yolo_id in parent_map:
+                        parent_id = parent_map[yolo_id]
+                        parent_hmr2_id = YOLO_TO_HMR2[parent_id]
+                        hmr2_bone_vector = hmr2_absolute[hmr2_id] - hmr2_absolute[parent_hmr2_id]
+                        parent_fused_pos = raw_fused_positions.get(parent_id, hmr2_absolute[parent_hmr2_id])
+                        hmr2_raw_3d = parent_fused_pos + hmr2_bone_vector
+                    else:
+                        hmr2_raw_3d = hmr2_absolute[hmr2_id]
+
+                    if yolo_id in current_3d and yolo_weight >= 1.0:
                         raw_3d = current_3d[yolo_id]
                         fused_sources[yolo_id] = "YOLO"
-                        
-                    # CASE B: Joint is occluded. Rely on HMR2.
+                    elif yolo_id in current_3d and yolo_weight > 0.0:
+                        raw_3d = (yolo_weight * current_3d[yolo_id]) + ((1.0 - yolo_weight) * hmr2_raw_3d)
+                        fused_sources[yolo_id] = "BLEND"
                     else:
+                        raw_3d = hmr2_raw_3d
                         fused_sources[yolo_id] = "HMR2"
-                        
-                        # If it is a limb joint, use Forward Kinematics (relative to parent)
-                        if yolo_id in parent_map:
-                            parent_id = parent_map[yolo_id]
-                            parent_hmr2_id = YOLO_TO_HMR2[parent_id]
-                            
-                            # Calculate the 3D bone vector from HMR2's perspective
-                            hmr2_bone_vector = hmr2_absolute[hmr2_id] - hmr2_absolute[parent_hmr2_id]
-                            
-                            # Attach that vector to wherever the parent ended up in our fused reality
-                            parent_fused_pos = raw_fused_positions.get(parent_id, hmr2_absolute[parent_hmr2_id])
-                            raw_3d = parent_fused_pos + hmr2_bone_vector
-                            
-                        # If it is a core joint, just use the absolute aligned HMR2 position
-                        else:
-                            raw_3d = hmr2_absolute[hmr2_id]
 
                     filter_input_3d = self.smooth_source_transition(
                         yolo_id,
@@ -834,8 +956,12 @@ class TrackerNode(Node):
 
                     # Low pass filtering
                     if yolo_id not in self.filters_3d:
-                        # min_cutoff: smoothness when human stationary, beta determines how much filter opens up as velocity increases
-                        self.filters_3d[yolo_id] = OneEuroFilter(current_time, filter_input_3d, min_cutoff=0.01, beta=3)
+                        self.filters_3d[yolo_id] = OneEuroFilter(
+                            current_time,
+                            filter_input_3d,
+                            min_cutoff=self.filter_min_cutoff,
+                            beta=self.filter_beta,
+                        )
                         
                     smooth_3d = self.filters_3d[yolo_id](current_time, filter_input_3d)
                     fused_3d_dict[yolo_id] = smooth_3d
@@ -854,14 +980,19 @@ class TrackerNode(Node):
                         v = int((pt3d[1] * fy / pt3d[2]) + cy_cam)
                         draw_points[yolo_id] = (u, v)
                         
-                        color = (0, 255, 0) if fused_sources[yolo_id] == "YOLO" else (255, 0, 255)
+                        if fused_sources[yolo_id] == "YOLO":
+                            color = (0, 255, 0)
+                        elif fused_sources[yolo_id] == "BLEND":
+                            color = (0, 165, 255)
+                        else:
+                            color = (255, 0, 255)
                         cv2.circle(display_frame, (u, v), 4, color, -1)
                         kx, ky, conf = kpts[yolo_id]
                         # cv2.putText(display_frame, f"conf: {conf:.2f}", (u, v-20), 
                         #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                        # if self.occlusion_reason.get(yolo_id):
-                        #     cv2.putText(display_frame, f"{self.occlusion_reason[yolo_id]}", (u, v-20), 
-                        #                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                        if self.occlusion_reason.get(yolo_id):
+                            cv2.putText(display_frame, f"{self.occlusion_reason[yolo_id]}", (u, v-20), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
                 # Virtual Neck Processing
                 # if 5 in fused_3d_dict and 6 in fused_3d_dict and 5 in draw_points and 6 in draw_points:
