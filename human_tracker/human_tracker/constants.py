@@ -30,6 +30,12 @@ HUMAN_CAPSULES = [
     (10, 10, 0.15, (0, 255, 0))   # R Hand
 ]
 
+def surface_to_joint_proj(id):
+    mapping = {0: 0.0, 5:0.1, 6:0.1, 7:0.02, 8:0.02, 
+                9:0.02, 10:0.02, 11:0.15, 12:0.15,
+                13:0.1, 14:0.1, 15:0.05, 16:0.05}
+    return mapping.get(id, 0.0)    
+
 def get_skeleton_map(id):
     mapping = {0:"nose", 5:"left shoulder", 6:"right shoulder", 7:"left elbow", 8:"right elbow", 
                 9:"left wrist", 10:"right wrist", 11:"left hip", 12:"right hip", 

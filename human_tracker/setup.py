@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
     'console_scripts': [
+        'validation_node = human_tracker.validate_hmr:main',
         'skeleton_tracker_node = human_tracker.skeleton_tracker_node_4DHumans:main',
     	],
     },
